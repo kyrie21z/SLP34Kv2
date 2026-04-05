@@ -1,0 +1,24 @@
+# @package _global_
+# Experiment config for large batch size training (96GB GPU)
+# Quick validation version - optimized for 62GB system memory
+
+defaults:
+  - _self_
+  - override /model: maevit_infonce_plm
+  - override /dataset: SLP34K
+
+trainer:
+  val_check_interval: 200  # Default 400 -> 200 (half, for bs=64, 430 steps/epoch)
+
+data:
+  num_workers: 2  # Minimal workers to avoid memory issues
+
+model:
+  # Minimal batch size for stable training on 62GB memory
+  batch_size: 64
+  lr: 1.7e-4  # Scaled: 8.4e-5 * (64/32) = 1.68e-4
+  
+  # Length head configuration
+  use_length_head: false  # Set to true to enable length prediction
+  length_loss_weight: 0.1
+  max_seq_length_for_head: 50
