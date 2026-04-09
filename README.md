@@ -1,6 +1,12 @@
-# SLP34K Current Project README
+# SLP34Kv2 Current Project README
 
-This repository is currently being used as an active research workspace for Ship License Plate Recognition on SLP34K.
+This repository is currently being used as an active research workspace for `SLP34Kv2`, an ongoing Ship License Plate Recognition research project built on top of the SLP34K dataset and the AAAI-25 strong baseline.
+
+Project name:
+
+- current project name: `SLP34Kv2`
+- dataset name: `SLP34K`
+- current local repository directory: `SLP34K` (kept unchanged to avoid path-side effects)
 
 The original public README from the AAAI-25 baseline release has been archived at [archive/README_AAAI25_original.md](/mnt/data/zyx/SLP34K/archive/README_AAAI25_original.md).
 
