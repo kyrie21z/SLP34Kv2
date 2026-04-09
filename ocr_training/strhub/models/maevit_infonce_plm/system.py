@@ -219,7 +219,10 @@ class Model(CrossEntropySystem):
             mae_model = getattr(models_mae, 'mae_vit_base_patch16_224x224')()
 
         chkpt_dir = mae_pretrained_path
-        checkpoint = torch.load(chkpt_dir, map_location='cpu', weights_only=False)
+        try:
+            checkpoint = torch.load(chkpt_dir, map_location='cpu', weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(chkpt_dir, map_location='cpu')
         
         mae_model.load_state_dict(checkpoint['model'], strict=False)
         self.encoder = mae_model

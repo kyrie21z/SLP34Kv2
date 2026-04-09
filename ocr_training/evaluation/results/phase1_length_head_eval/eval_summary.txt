@@ -1,0 +1,4 @@
+checkpoint       : outputs/new_oov/maevit_infonce_plm/2026-04-05_22-13-13/checkpoints/last.ckpt
+has_length_head  : True
+total_samples    : 6884
+overall_accuracy : 80.8977%

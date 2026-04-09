@@ -42,11 +42,13 @@ trainer:
 
 pretrained: null
 ckpt_path: null
+run_group: new_oov
+run_tag: default
 
 hydra:
   output_subdir: config
   run:
-    dir: outputs/new_oov/${model.name}/${now:%Y-%m-%d}_${now:%H-%M-%S}
+    dir: outputs/${run_group}/${model.name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${run_tag}
   sweep:
     dir: multirun/${model.name}/${now:%Y-%m-%d}_${now:%H-%M-%S}
     subdir: ${hydra.job.override_dirname}

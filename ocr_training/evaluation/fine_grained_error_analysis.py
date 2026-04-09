@@ -31,7 +31,10 @@ sys.path.insert(0, str(project_root))
 import matplotlib
 matplotlib.use('Agg')  # 无头模式
 import matplotlib.pyplot as plt
-import seaborn as sns
+try:
+    import seaborn as sns
+except ModuleNotFoundError:
+    sns = None
 from difflib import SequenceMatcher
 
 
