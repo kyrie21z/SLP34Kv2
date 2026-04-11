@@ -30,6 +30,7 @@ data:
   normalize_unicode: false
   augment: true
   num_workers: 40
+  return_train_index: false
 
 trainer:
   _target_: pytorch_lightning.Trainer

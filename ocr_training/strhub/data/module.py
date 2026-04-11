@@ -19,7 +19,7 @@ import os
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 from torchvision import transforms as T
-from .dataset import build_tree_dataset, LmdbDataset
+from .dataset import build_tree_dataset, LmdbDataset, IndexedDataset
 import natsort,glob
 class SceneTextDataModule(pl.LightningDataModule):
     TEST_Six_BENCHMARK = ['IIIT5k', 'SVT','IC13_1015','IC15_2077' ,'SVTP', 'CUTE80']
@@ -31,7 +31,8 @@ class SceneTextDataModule(pl.LightningDataModule):
     def __init__(self, root_dir: str, train_dir: str, val_dir: str,test_dir: str,img_size: Sequence[int], max_label_length: int,
                  charset_train: str, charset_test: str, batch_size: int, num_workers: int, augment: bool,
                  remove_whitespace: bool = False, normalize_unicode: bool = False,
-                 min_image_dim: int = 0, rotation: int = 0, collate_fn: Optional[Callable] = None):
+                 min_image_dim: int = 0, rotation: int = 0, collate_fn: Optional[Callable] = None,
+                 return_train_index: bool = False):
         super().__init__()
         self.root_dir = root_dir
         self.train_dir = train_dir
@@ -49,6 +50,7 @@ class SceneTextDataModule(pl.LightningDataModule):
         self.min_image_dim = min_image_dim
         self.rotation = rotation
         self.collate_fn = collate_fn
+        self.return_train_index = return_train_index
         self._train_dataset = None
         self._val_dataset = None
         self.mean = (0.48145466, 0.4578275, 0.40821073) 
@@ -75,9 +77,12 @@ class SceneTextDataModule(pl.LightningDataModule):
         if self._train_dataset is None:
             transform = self.get_transform(self.img_size, self.augment)
             root = PurePath(self.root_dir, 'train', self.train_dir)
-            self._train_dataset = build_tree_dataset(root, self.charset_train, self.max_label_length,
-                                                     self.min_image_dim, self.remove_whitespace, self.normalize_unicode,
-                                                     transform=transform)
+            dataset = build_tree_dataset(root, self.charset_train, self.max_label_length,
+                                         self.min_image_dim, self.remove_whitespace, self.normalize_unicode,
+                                         transform=transform)
+            if self.return_train_index:
+                dataset = IndexedDataset(dataset)
+            self._train_dataset = dataset
         return self._train_dataset
 
     @property

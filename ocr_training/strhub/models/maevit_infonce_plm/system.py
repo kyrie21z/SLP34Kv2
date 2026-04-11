@@ -18,7 +18,7 @@ import math
 from functools import partial
 from itertools import permutations
 from pathlib import Path
-from typing import Sequence, Any, Optional, Dict, List, Tuple
+from typing import Sequence, Any, Optional, Dict, List, Tuple, Set
 
 import numpy as np
 import torch
@@ -285,7 +285,14 @@ class Model(CrossEntropySystem):
                  joint_glyph_loss_weight: float = 0.05,
                  joint_glyph_margin: float = 0.35,
                  use_length_head: bool = False, length_loss_weight: float = 0.1,
-                 max_seq_length_for_head: int = 50, **kwargs: Any) -> None:
+                 max_seq_length_for_head: int = 50,
+                 enable_tail_kd: bool = False,
+                 tail_split_csv_path: str = '',
+                 tail_sample_prefix: str = 'SLP34K_lmdb_train',
+                 tail_kd_teacher_ckpt_path: str = '',
+                 tail_kd_lambda: float = 0.10,
+                 tail_kd_tau: float = 2.0,
+                 **kwargs: Any) -> None:
         super().__init__(charset_train, charset_test, batch_size, lr, warmup_pct, weight_decay)
         self.save_hyperparameters()
         
@@ -330,6 +337,15 @@ class Model(CrossEntropySystem):
         self.use_joint_glyph_train_aux = use_joint_glyph_train_aux
         self.joint_glyph_loss_weight = joint_glyph_loss_weight
         self.joint_glyph_margin = joint_glyph_margin
+        self.enable_tail_kd = bool(enable_tail_kd)
+        self.tail_split_csv_path = str(tail_split_csv_path or '')
+        self.tail_sample_prefix = str(tail_sample_prefix)
+        self.tail_kd_teacher_ckpt_path = str(tail_kd_teacher_ckpt_path or '')
+        self.tail_kd_lambda = float(tail_kd_lambda)
+        self.tail_kd_tau = float(tail_kd_tau)
+        self.tail_index_set: Set[int] = set()
+        if self.enable_tail_kd and self.tail_split_csv_path:
+            self.tail_index_set = self._load_tail_index_set(self.tail_split_csv_path)
 
         self.coef_lr = kwargs["coef_lr"] if "coef_lr" in kwargs.keys() else 1.0
         self.coef_wd = kwargs["coef_wd"] if "coef_wd" in kwargs.keys() else 1.0
@@ -421,6 +437,102 @@ class Model(CrossEntropySystem):
         # Encoder has its own init.
         named_apply(partial(init_weights, exclude=['encoder']), self)
         nn.init.trunc_normal_(self.pos_queries, std=.02)
+        if self.enable_tail_kd and self.tail_kd_teacher_ckpt_path:
+            object.__setattr__(self, 'teacher_model', self._load_frozen_teacher_model(self.tail_kd_teacher_ckpt_path))
+        else:
+            object.__setattr__(self, 'teacher_model', None)
+
+    def _load_tail_index_set(self, csv_path: str) -> Set[int]:
+        path = Path(csv_path)
+        if not path.exists():
+            raise FileNotFoundError(f'Tail split file not found: {path}')
+        tail_ids: Set[int] = set()
+        with path.open('r', encoding='utf-8', newline='') as f:
+            reader = csv.DictReader(f)
+            if 'sample_id' not in (reader.fieldnames or []):
+                raise ValueError(f"'sample_id' column missing in tail split: {path}")
+            for row in reader:
+                if str(row.get('tail_label', '')).strip().lower() != 'tail':
+                    continue
+                sample_id = str(row['sample_id']).strip()
+                if ':' in sample_id:
+                    sample_id = sample_id.rsplit(':', 1)[-1]
+                try:
+                    tail_ids.add(int(sample_id))
+                except ValueError as exc:
+                    raise ValueError(f'Invalid sample_id in tail split: {row["sample_id"]}') from exc
+        return tail_ids
+
+    def _load_frozen_teacher_model(self, checkpoint_path: str):
+        from strhub.models.utils import load_from_checkpoint
+
+        teacher = load_from_checkpoint(
+            checkpoint_path,
+            enable_tail_kd=False,
+            tail_split_csv_path='',
+            tail_kd_teacher_ckpt_path='',
+        )
+        teacher.eval()
+        for param in teacher.parameters():
+            param.requires_grad = False
+        return teacher
+
+    def on_fit_start(self) -> None:
+        super().on_fit_start()
+        teacher = getattr(self, 'teacher_model', None)
+        if teacher is not None:
+            teacher.to(self.device)
+            teacher.eval()
+
+    def _build_tail_mask(self, sample_ids, batch_size: int) -> torch.Tensor:
+        mask = torch.zeros(batch_size, dtype=torch.bool, device=self._device)
+        if not self.tail_index_set:
+            return mask
+        if torch.is_tensor(sample_ids):
+            ids = sample_ids.detach().cpu().tolist()
+        else:
+            ids = list(sample_ids)
+        for i, sid in enumerate(ids):
+            if isinstance(sid, str):
+                sid_text = sid.strip()
+                if ':' in sid_text:
+                    sid_text = sid_text.rsplit(':', 1)[-1]
+                try:
+                    sid = int(sid_text)
+                except ValueError:
+                    continue
+            if int(sid) in self.tail_index_set:
+                mask[i] = True
+        return mask
+
+    def _compute_tail_token_ce(self, student_logits: Tensor, tgt_out: Tensor, tail_mask: Tensor) -> Tensor:
+        if not tail_mask.any():
+            return student_logits.new_tensor(0.0)
+        token_valid = (tgt_out != self.pad_id) & tail_mask.unsqueeze(1)
+        token_count = token_valid.sum()
+        if token_count == 0:
+            return student_logits.new_tensor(0.0)
+        ce_all = F.cross_entropy(
+            student_logits.flatten(end_dim=1),
+            tgt_out.flatten(),
+            ignore_index=self.pad_id,
+            reduction='none',
+        ).view_as(tgt_out)
+        return ce_all.masked_select(token_valid).mean()
+
+    def _compute_tail_kd_kl(self, student_logits: Tensor, teacher_logits: Tensor, tgt_out: Tensor,
+                            tail_mask: Tensor) -> Tensor:
+        if not tail_mask.any():
+            return student_logits.new_tensor(0.0)
+        token_valid = (tgt_out != self.pad_id) & tail_mask.unsqueeze(1)
+        token_count = token_valid.sum()
+        if token_count == 0:
+            return student_logits.new_tensor(0.0)
+        tau = self.tail_kd_tau
+        student_log_probs = F.log_softmax(student_logits / tau, dim=-1)
+        teacher_probs = F.softmax(teacher_logits / tau, dim=-1)
+        token_kl = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)
+        return token_kl.masked_select(token_valid).mean() * (tau * tau)
   
 
     def encode(self, img,labels = None):
@@ -1059,7 +1171,11 @@ class Model(CrossEntropySystem):
         return content_mask, query_mask
 
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
-        images, labels = batch
+        if len(batch) == 3:
+            images, labels, sample_ids = batch
+        else:
+            images, labels = batch
+            sample_ids = None
         tgt = self.tokenizer.encode(labels, self._device) # B * (T+1)
 
         memory,cross_modal_loss = self.encode(images,labels) # B*197*768
@@ -1115,6 +1231,26 @@ class Model(CrossEntropySystem):
             self.log('length_loss', length_loss)
             self.log('length_acc', length_acc * 100)
         
+        tail_mask = None
+        tail_ratio = 0.0
+        tail_ce = ocr_loss.new_tensor(0.0)
+        tail_kd_loss = ocr_loss.new_tensor(0.0)
+        kd_adjust = ocr_loss.new_tensor(0.0)
+        if self.enable_tail_kd and sample_ids is not None and getattr(self, 'teacher_model', None) is not None:
+            tail_mask = self._build_tail_mask(sample_ids, images.shape[0])
+            tail_ratio = float(tail_mask.float().mean().item())
+            if tail_mask.any():
+                teacher = self.teacher_model
+                with torch.no_grad():
+                    teacher_memory, _ = teacher.encode(images, labels)
+                    teacher_out = teacher.decode(
+                        tgt_in, teacher_memory, tgt_mask, tgt_padding_mask, tgt_query_mask=query_mask
+                    )
+                    teacher_step_logits = teacher.head(teacher_out)
+                tail_ce = self._compute_tail_token_ce(step_logits, tgt_out, tail_mask)
+                tail_kd_loss = self._compute_tail_kd_kl(step_logits, teacher_step_logits, tgt_out, tail_mask)
+                kd_adjust = self.tail_kd_lambda * (tail_kd_loss - tail_ce)
+
         # Total loss
         loss = ocr_loss + 0.1 * cross_modal_loss
         if self.use_length_head:
@@ -1123,10 +1259,17 @@ class Model(CrossEntropySystem):
             loss = loss + self.substitution_train_loss_weight * substitution_aux_loss
         if self.use_joint_glyph_train_aux:
             loss = loss + self.joint_glyph_loss_weight * joint_glyph_aux_loss
+        if self.enable_tail_kd and sample_ids is not None and getattr(self, 'teacher_model', None) is not None:
+            loss = loss + kd_adjust
 
         self.log('loss', loss)
         self.log('ocr_loss', ocr_loss)
         self.log('cross_modal_loss', cross_modal_loss)
+        if self.enable_tail_kd:
+            self.log('tail_ratio', tail_ratio, prog_bar=False)
+            self.log('tail_ce', tail_ce, prog_bar=False)
+            self.log('tail_kd', tail_kd_loss, prog_bar=False)
+            self.log('tail_kd_adjust', kd_adjust, prog_bar=False)
         if self.use_substitution_train_aux:
             self.log('substitution_aux_loss', substitution_aux_loss)
         if self.use_joint_glyph_train_aux:

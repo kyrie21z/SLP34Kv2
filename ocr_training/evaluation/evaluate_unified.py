@@ -35,6 +35,7 @@ import json
 import sys
 from pathlib import Path
 from collections import Counter
+from typing import List
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -52,6 +53,11 @@ sys.path.insert(0, str(project_root))
 from strhub.models.utils import load_from_checkpoint, parse_model_args
 from strhub.data.utils import CharsetAdapter
 from strhub.data.module import SceneTextDataModule
+from evaluation.analyze_m05_alignment import (
+    length_bucket,
+    levenshtein_alignment,
+    normalized_vocab_bucket,
+)
 
 # ── constants ─────────────────────────────────────────────────────────────────
 CHARSET_SLP34K = (
@@ -80,6 +86,32 @@ DIAG_FIELDNAMES = [
     'passed_uncertainty_gate', 'passed_length_gate', 'eos_bias_applied',
     'num_steps_modified', 'num_steps_argmax_changed',
     'eos_type_before', 'eos_type_after',
+]
+
+TRAIN_SCORE_FIELDNAMES = [
+    'sample_id',
+    'image_path',
+    'gt_text',
+    'pred_text_teacher',
+    'avg_token_conf_teacher',
+    'min_token_conf_teacher',
+    'teacher_vs_gt_edit_distance',
+    'norm_edit_distance',
+    'pred_len',
+    'gt_len',
+    'len_gap',
+    'is_expand',
+    'is_trunc',
+    'layout',
+    'difficulty',
+    'is_oov',
+    'len_bucket',
+    'vocabulary_type',
+    'resolution_type',
+    'num_replace',
+    'num_insert',
+    'num_delete',
+    'historical_train_loss',
 ]
 
 
@@ -188,6 +220,241 @@ def collate_fn(batch):
     )
 
 
+class GenericLmdbDataset(Dataset):
+    """Reads labels/images from any LMDB and loads meta-* if available."""
+
+    def __init__(
+        self,
+        root: str,
+        charset: str,
+        max_label_len: int,
+        transform=None,
+        remove_whitespace: bool = False,
+    ):
+        self.root = root
+        self.charset_adapter = CharsetAdapter(charset)
+        self.max_label_len = max_label_len
+        self.remove_whitespace = remove_whitespace
+        self.transform = transform
+        self._env = None
+        self.labels = []
+        self.metas = []
+        self.filtered_index_list = []
+        self.num_samples = self._preprocess_labels()
+
+    def _open_env(self):
+        return lmdb.open(
+            self.root, max_readers=1, readonly=True, create=False,
+            readahead=False, meminit=False, lock=False,
+        )
+
+    @property
+    def env(self):
+        if self._env is None:
+            self._env = self._open_env()
+        return self._env
+
+    def _preprocess_labels(self) -> int:
+        with self._open_env() as e:
+            with e.begin() as txn:
+                num_samples = int(txn.get(b'num-samples'))
+                for index in range(num_samples):
+                    index += 1  # LMDB keys are 1-based
+                    label_raw = txn.get(f'label-{index:09d}'.encode())
+                    if label_raw is None:
+                        continue
+                    label = label_raw.decode()
+                    if self.remove_whitespace:
+                        label = ''.join(label.split())
+                    if len(label) > self.max_label_len:
+                        continue
+                    label = self.charset_adapter(label)
+                    if not label:
+                        continue
+                    meta_raw = txn.get(f'meta-{index:09d}'.encode())
+                    meta = json.loads(meta_raw.decode()) if meta_raw else {}
+                    self.labels.append(label)
+                    self.metas.append(meta)
+                    self.filtered_index_list.append(index)
+                return len(self.labels)
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        i = self.filtered_index_list[idx]
+        with self.env.begin() as txn:
+            img_bytes = txn.get(f'image-{i:09d}'.encode())
+        label = self.labels[idx]
+        meta = self.metas[idx]
+        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img, label, json.dumps(meta, ensure_ascii=False), i, self.root
+
+
+def collate_generic_fn(batch):
+    imgs, labels, metas, indices, lmdb_roots = zip(*batch)
+    return (
+        torch.stack(imgs),
+        list(labels),
+        [json.loads(m) for m in metas],
+        list(indices),
+        list(lmdb_roots),
+    )
+
+
+def discover_lmdb_roots(path: str) -> List[Path]:
+    root = Path(path)
+    if not root.exists():
+        raise FileNotFoundError(f'Path does not exist: {root}')
+    if (root / 'data.mdb').exists():
+        return [root]
+    db_files = sorted(root.rglob('data.mdb'))
+    return [p.parent for p in db_files]
+
+
+@torch.inference_mode()
+def export_teacher_scores(
+    args,
+    model,
+    has_head: bool,
+    hp,
+    out_dir: Path,
+):
+    if not args.source_lmdb_path:
+        raise ValueError('--source_lmdb_path is required when exporting teacher scores')
+    lmdb_roots = discover_lmdb_roots(args.source_lmdb_path)
+    if not lmdb_roots:
+        raise RuntimeError(f'No LMDB found under: {args.source_lmdb_path}')
+
+    img_size = getattr(hp, 'img_size', [224, 224])
+    transform = SceneTextDataModule.get_transform(tuple(img_size))
+    csv_path = Path(args.export_train_scores_csv)
+    jsonl_path = Path(args.export_train_scores_jsonl) if args.export_train_scores_jsonl else None
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    if jsonl_path is not None:
+        jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+
+    max_samples = args.max_samples if args.max_samples and args.max_samples > 0 else None
+    written = 0
+
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f_csv:
+        writer = csv.DictWriter(f_csv, fieldnames=TRAIN_SCORE_FIELDNAMES)
+        writer.writeheader()
+        f_jsonl = open(jsonl_path, 'w', encoding='utf-8') if jsonl_path is not None else None
+        try:
+            for lmdb_root in lmdb_roots:
+                dataset = GenericLmdbDataset(
+                    str(lmdb_root),
+                    charset=CHARSET_SLP34K,
+                    max_label_len=getattr(hp, 'max_label_length', 50),
+                    transform=transform,
+                )
+                loader = DataLoader(
+                    dataset,
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                    collate_fn=collate_generic_fn,
+                    shuffle=False,
+                )
+                print(f'Export source: {lmdb_root} | samples: {len(dataset)}')
+                for imgs, labels, metas, indices, lmdb_paths in tqdm(loader, desc=f'Export {lmdb_root.name}'):
+                    imgs = imgs.to(args.device)
+                    memory = model.encode(imgs)
+                    logits = model.forward(imgs)
+                    probs = logits.softmax(-1)
+                    pred_raws, pred_prob_tensors = model.tokenizer.decode(probs)
+                    if has_head:
+                        len_logits = model.length_head(memory)
+                        head_preds = len_logits.argmax(dim=-1).cpu().tolist()
+                    else:
+                        head_preds = [-1] * len(labels)
+
+                    for gt, pred_raw, pred_prob, meta, lmdb_index, lmdb_path, head_len in zip(
+                        labels, pred_raws, pred_prob_tensors, metas, indices, lmdb_paths, head_preds
+                    ):
+                        pred = model.charset_adapter(pred_raw)
+                        pred_probs = pred_prob.detach().cpu().tolist()
+                        avg_conf = sum(pred_probs) / len(pred_probs) if pred_probs else 0.0
+                        min_conf = min(pred_probs) if pred_probs else 0.0
+                        edit_distance, ops = levenshtein_alignment(gt, pred)
+                        num_replace = sum(op['op'] == 'R' for op in ops)
+                        num_insert = sum(op['op'] == 'I' for op in ops)
+                        num_delete = sum(op['op'] == 'D' for op in ops)
+                        gt_len = len(gt)
+                        pred_len = len(pred)
+                        len_gap = pred_len - gt_len
+                        vocab_type = meta.get('vocabulary_type', '')
+                        normalized_oov = normalized_vocab_bucket(vocab_type) if vocab_type else ''
+                        sample_id = str(meta.get('id', f'{Path(lmdb_path).name}:{lmdb_index}'))
+                        image_path = str(meta.get('image_path', meta.get('path', '')))
+
+                        row = {
+                            'sample_id': sample_id,
+                            'image_path': image_path,
+                            'gt_text': gt,
+                            'pred_text_teacher': pred,
+                            'avg_token_conf_teacher': float(avg_conf),
+                            'min_token_conf_teacher': float(min_conf),
+                            'teacher_vs_gt_edit_distance': int(edit_distance),
+                            'norm_edit_distance': float(edit_distance / max(1, gt_len, pred_len)),
+                            'pred_len': int(pred_len),
+                            'gt_len': int(gt_len),
+                            'len_gap': int(len_gap),
+                            'is_expand': bool(len_gap > 0),
+                            'is_trunc': bool(len_gap < 0),
+                            'layout': meta.get('structure', meta.get('layout', '')),
+                            'difficulty': meta.get('quality', meta.get('difficulty', '')),
+                            'is_oov': (normalized_oov == 'OOV') if normalized_oov else '',
+                            'len_bucket': length_bucket(gt_len),
+                            'vocabulary_type': vocab_type,
+                            'resolution_type': meta.get('resolution_type', ''),
+                            'num_replace': int(num_replace),
+                            'num_insert': int(num_insert),
+                            'num_delete': int(num_delete),
+                            'historical_train_loss': '',
+                        }
+                        writer.writerow(row)
+                        if f_jsonl is not None:
+                            payload = dict(row)
+                            payload.update({
+                                'lmdb_path': str(lmdb_path),
+                                'lmdb_index': int(lmdb_index),
+                                'pred_len_from_head': int(head_len),
+                            })
+                            f_jsonl.write(json.dumps(payload, ensure_ascii=False) + '\n')
+                        written += 1
+                        if max_samples is not None and written >= max_samples:
+                            break
+                    if max_samples is not None and written >= max_samples:
+                        break
+                if max_samples is not None and written >= max_samples:
+                    break
+        finally:
+            if f_jsonl is not None:
+                f_jsonl.close()
+
+    print(f'Exported teacher-scored samples: {written}')
+    print(f'CSV saved: {csv_path}')
+    if jsonl_path is not None:
+        print(f'JSONL saved: {jsonl_path}')
+    summary_path = out_dir / 'train_teacher_probe_summary.txt'
+    summary_path.write_text(
+        '\n'.join([
+            f'checkpoint: {args.checkpoint}',
+            f'source_lmdb_path: {args.source_lmdb_path}',
+            f'num_lmdb_roots: {len(lmdb_roots)}',
+            f'written_samples: {written}',
+            f'csv: {csv_path}',
+            f'jsonl: {jsonl_path if jsonl_path else ""}',
+            f'max_samples: {max_samples if max_samples is not None else "all"}',
+        ]) + '\n',
+        encoding='utf-8',
+    )
+    print(f'Summary: {summary_path}')
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 @torch.inference_mode()
 def main():
@@ -212,6 +479,14 @@ def main():
                         help='Save phase2_diagnostic_report.md when diagnostics are enabled')
     parser.add_argument('--image_ids_file', default=None,
                         help='Optional text/csv file with image ids to evaluate, one per line')
+    parser.add_argument('--source_lmdb_path', default=None,
+                        help='Generic LMDB root/path to score (used by train export mode)')
+    parser.add_argument('--export_train_scores_csv', default=None,
+                        help='If set, export teacher-scored rows to this CSV and skip unified-eval outputs')
+    parser.add_argument('--export_train_scores_jsonl', default=None,
+                        help='Optional JSONL output path for teacher-scored rows')
+    parser.add_argument('--max_samples', type=int, default=0,
+                        help='Optional max samples for quick sanity export (0 = all)')
     args, unknown = parser.parse_known_args()
     kwargs = parse_model_args(unknown)
 
@@ -237,6 +512,10 @@ def main():
     )
     if diagnostics_enabled and hasattr(model, 'reset_eos_diagnostics'):
         model.reset_eos_diagnostics()
+
+    if args.export_train_scores_csv:
+        export_teacher_scores(args, model, has_head, hp, out_dir)
+        return
 
     # ── data ──────────────────────────────────────────────────────────────────
     img_size  = getattr(hp, 'img_size', [224, 224])

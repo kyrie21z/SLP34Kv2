@@ -135,3 +135,17 @@ class LmdbDataset(Dataset):
 
         return img,label
 
+
+class IndexedDataset(Dataset):
+    """Wraps a dataset and appends 1-based global sample index for each item."""
+
+    def __init__(self, dataset: Dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        img, label = self.dataset[index]
+        return img, label, index + 1
+
