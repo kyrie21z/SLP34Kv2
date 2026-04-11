@@ -1,7 +1,7 @@
 # Output directories
 .github/
 .vscode/
-outputs/
+ocr_training/outputs/
 archive/
 pretrain_model/
 pretrain_data/
