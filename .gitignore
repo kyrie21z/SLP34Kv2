@@ -2,7 +2,6 @@
 .github/
 .vscode/
 outputs/
-results/
 archive/
 pretrain_model/
 pretrain_data/
