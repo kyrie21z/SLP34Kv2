@@ -1,0 +1,10 @@
+name: maevit_ctc_probe
+_target_: strhub.models.maevit_ctc_probe.system.Model
+
+# model
+embed_dim: 768
+mae_pretrained_path: pretrain_model/ship/224x224_pretrain_ship_vit_checkpoint-1499.pth
+dropout: 0.0
+
+# Training
+lr: 8.4e-5

@@ -1,0 +1,4 @@
+model_tag,num_samples,accuracy,accuracy_delta_vs_m04_raw,replace_total,replace_total_delta_vs_m04_raw,insert_total,delete_total,replace_share,replace_share_delta_vs_m04_raw,replace_head_total,replace_middle_total,replace_tail_total
+m04_glyph,105,0.0,0.0,200,2,4,25,0.8733624454148472,0.0011157493796049023,77,54,69
+m04_substitution,105,0.009523809523809525,0.009523809523809525,199,1,4,25,0.8728070175438597,0.0005603215086174007,77,53,69
+m04_joint,105,0.009523809523809525,0.009523809523809525,198,0,4,25,0.8722466960352423,0.0,77,53,68

@@ -1,0 +1,20 @@
+{
+  "checkpoint": "outputs/M07/maevit_ctc_probe/2026-04-10_22-52-57_s1_adapter_triage/checkpoints/last.ckpt",
+  "num_samples": 256,
+  "blank_token_rate": 1.0,
+  "empty_prediction_ratio": 1.0,
+  "avg_pred_len": 0.0,
+  "pred_len_distribution_top20": [
+    [
+      0,
+      256
+    ]
+  ],
+  "input_lengths_unique": [
+    196
+  ],
+  "target_length_min": 5,
+  "target_length_max": 30,
+  "target_len_gt_T_count": 0,
+  "illegal_prediction_count": 0
+}

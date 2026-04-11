@@ -1,0 +1,5 @@
+variant,scope,num_samples,overall_acc,single_acc,hard_acc,oov_acc,long21_acc,replace,insert,delete,avg_pred_len
+S0_e1,all,6884,0.0,0.0,0.0,0.0,0.0,0,0,94815,0.0
+S1_adapter,all,6884,0.0,0.0,0.0,0.0,0.0,0,0,94815,0.0
+S3_bilstm,all,6884,0.0,0.0,0.0,0.0,0.0,0,0,94815,0.0
+S2_single_eval,single,2042,0.0,0.0,0.0,0.0,0.0,17303,306159,1470,159.35259549461313

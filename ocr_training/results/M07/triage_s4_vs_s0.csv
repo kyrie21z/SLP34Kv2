@@ -1,0 +1,3 @@
+variant,num_samples,overall_acc,single_acc,hard_acc,oov_acc,long21_acc,replace,insert,delete,avg_pred_len
+S0_e1,6884,0.0,0.0,0.0,0.0,0.0,0,0,94815,0.0
+S4_stability,6884,0.0,0.0,0.0,0.0,0.0,8777,18973,80855,4.783991865194654

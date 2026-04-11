@@ -2,12 +2,16 @@
 .github/
 .vscode/
 outputs/
+results/
+archive/
 pretrain_model/
 pretrain_data/
 checkpoint/
 SLP34K/
 flagged/
 ocr_training/data
+ocr_training/figures/
+ocr_training/results/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -156,3 +160,6 @@ cython_debug/
 .codex
 
 scripts/
+
+# 测试结果
+ocr_training/evaluation/*

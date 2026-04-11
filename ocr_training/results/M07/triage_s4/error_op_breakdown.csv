@@ -1,0 +1,3 @@
+model_tag,num_samples,accuracy,replace_total,insert_total,delete_total,eos_early_total,eos_late_total,replace_share,replace_head_total,replace_middle_total,replace_tail_total
+baseline_ar,6884,0.8282975014526438,1758,2606,2286,349,318,0.2643609022556391,900,513,345
+s4_stability,6884,0.0,8777,18973,80855,6132,705,0.08081580037751485,3556,2410,2811

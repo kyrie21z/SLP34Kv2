@@ -1,0 +1,9 @@
+eval_scope,model_tag,samples,correct,accuracy,replace_total,insert_total,delete_total
+pilot_focus_105,baseline_raw,105,17,0.1619047619047619,193,18,19
+pilot_focus_105,m04_final_raw,105,0,0.0,198,4,25
+pilot_focus_105,m06_sub_train,105,7,0.06666666666666667,195,20,44
+pilot_focus_105,m06_joint_train,105,9,0.08571428571428572,192,22,43
+full_unified_6884,baseline_raw,6884,5702,0.8282975014526438,2276,2240,1920
+full_unified_6884,m04_final_raw,6884,5707,0.8290238233585125,2347,2394,1702
+full_unified_6884,m06_sub_train,6884,5641,0.8194363742010459,2410,2278,1938
+full_unified_6884,m06_joint_train,6884,5636,0.8187100522951772,2420,2349,1866

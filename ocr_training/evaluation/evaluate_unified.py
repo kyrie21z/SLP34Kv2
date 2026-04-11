@@ -34,6 +34,7 @@ import csv
 import json
 import sys
 from pathlib import Path
+from collections import Counter
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -48,7 +49,9 @@ script_dir = Path(__file__).parent
 project_root = script_dir.parent
 sys.path.insert(0, str(project_root))
 
-from strhub.models.utils import load_from_checkpoint
+from strhub.models.utils import load_from_checkpoint, parse_model_args
+from strhub.data.utils import CharsetAdapter
+from strhub.data.module import SceneTextDataModule
 
 # ── constants ─────────────────────────────────────────────────────────────────
 CHARSET_SLP34K = (
@@ -68,6 +71,15 @@ CSV_FIELDNAMES = [
     'image_id', 'quality', 'layout', 'vocabulary_type', 'resolution_type',
     'gt', 'pred', 'correct', 'error_type', 'note',
     'gt_len', 'pred_text_len', 'eos_type', 'pred_len_from_head',
+]
+
+DIAG_FIELDNAMES = [
+    'image_id', 'correct_before', 'pred_before', 'pred_after',
+    'final_prediction_changed', 'gt_len', 'pred_text_len_before', 'pred_text_len_after',
+    'pred_len_from_head', 'uncertainty_value', 'gating_enabled',
+    'passed_uncertainty_gate', 'passed_length_gate', 'eos_bias_applied',
+    'num_steps_modified', 'num_steps_argmax_changed',
+    'eos_type_before', 'eos_type_after',
 ]
 
 
@@ -95,11 +107,26 @@ def get_eos_type(gt_len: int, pred_len: int) -> str:
 class UnifiedLmdbDataset(Dataset):
     """Reads unified_lmdb which stores image / label / meta (JSON)."""
 
-    def __init__(self, root: str, transform=None):
+    def __init__(
+        self,
+        root: str,
+        charset: str,
+        max_label_len: int,
+        transform=None,
+        remove_whitespace: bool = False,
+        allowed_ids=None,
+    ):
         self.root = root
+        self.charset_adapter = CharsetAdapter(charset)
+        self.max_label_len = max_label_len
+        self.remove_whitespace = remove_whitespace
         self.transform = transform
+        self.allowed_ids = None if allowed_ids is None else {str(x) for x in allowed_ids}
         self._env = None
-        self.num_samples = self._count_samples()
+        self.labels = []
+        self.metas = []
+        self.filtered_index_list = []
+        self.num_samples = self._preprocess_labels()
 
     def _open_env(self):
         return lmdb.open(
@@ -113,21 +140,38 @@ class UnifiedLmdbDataset(Dataset):
             self._env = self._open_env()
         return self._env
 
-    def _count_samples(self) -> int:
+    def _preprocess_labels(self) -> int:
         with self._open_env() as e:
             with e.begin() as txn:
-                return int(txn.get(b'num-samples'))
+                num_samples = int(txn.get(b'num-samples'))
+                for index in range(num_samples):
+                    index += 1  # LMDB keys are 1-based
+                    label = txn.get(f'label-{index:09d}'.encode()).decode()
+                    if self.remove_whitespace:
+                        label = ''.join(label.split())
+                    if len(label) > self.max_label_len:
+                        continue
+                    label = self.charset_adapter(label)
+                    if not label:
+                        continue
+                    meta_raw = txn.get(f'meta-{index:09d}'.encode())
+                    meta = json.loads(meta_raw.decode()) if meta_raw else {}
+                    if self.allowed_ids is not None and str(meta.get('id', '')) not in self.allowed_ids:
+                        continue
+                    self.labels.append(label)
+                    self.metas.append(meta)
+                    self.filtered_index_list.append(index)
+                return len(self.labels)
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        i = idx + 1  # LMDB keys are 1-based
+        i = self.filtered_index_list[idx]
         with self.env.begin() as txn:
             img_bytes = txn.get(f'image-{i:09d}'.encode())
-            label     = txn.get(f'label-{i:09d}'.encode()).decode()
-            meta_raw  = txn.get(f'meta-{i:09d}'.encode())
-        meta = json.loads(meta_raw.decode()) if meta_raw else {}
+        label = self.labels[idx]
+        meta = self.metas[idx]
         img  = Image.open(io.BytesIO(img_bytes)).convert('RGB')
         if self.transform:
             img = self.transform(img)
@@ -160,7 +204,16 @@ def main():
                         help='DataLoader workers (0 = main process, safest for LMDB)')
     parser.add_argument('--output_dir', default=None,
                         help='Output directory (default: <ckpt_parent_parent>/eval_unified)')
-    args = parser.parse_args()
+    parser.add_argument('--enable_eos_diagnostics', action='store_true',
+                        help='Enable selective-EOS diagnostic outputs')
+    parser.add_argument('--save_eos_diagnostics_csv', action='store_true',
+                        help='Save eos_diagnostics.csv when diagnostics are enabled')
+    parser.add_argument('--save_eos_diagnostics_report', action='store_true',
+                        help='Save phase2_diagnostic_report.md when diagnostics are enabled')
+    parser.add_argument('--image_ids_file', default=None,
+                        help='Optional text/csv file with image ids to evaluate, one per line')
+    args, unknown = parser.parse_known_args()
+    kwargs = parse_model_args(unknown)
 
     ckpt = Path(args.checkpoint)
     out_dir = (Path(args.output_dir) if args.output_dir
@@ -173,20 +226,37 @@ def main():
         str(ckpt),
         mae_pretrained_path='pretrain_model/ship/224x224_pretrain_ship_vit_checkpoint-1499.pth',
         charset_test=CHARSET_SLP34K,
+        **kwargs,
     ).eval().to(args.device)
     hp = model.hparams
     has_head = getattr(model, 'use_length_head', False)
     print(f'Length head: {has_head}')
+    diagnostics_enabled = (
+        args.enable_eos_diagnostics
+        or getattr(model, 'enable_eos_diagnostics', False)
+    )
+    if diagnostics_enabled and hasattr(model, 'reset_eos_diagnostics'):
+        model.reset_eos_diagnostics()
 
     # ── data ──────────────────────────────────────────────────────────────────
     img_size  = getattr(hp, 'img_size', [224, 224])
-    transform = T.Compose([
-        T.Resize(img_size, T.InterpolationMode.BICUBIC),
-        T.ToTensor(),
-        T.Normalize((0.48145466, 0.4578275, 0.40821073),
-                    (0.26862954, 0.26130258, 0.27577711)),
-    ])
-    dataset = UnifiedLmdbDataset(args.unified_db, transform)
+    transform = SceneTextDataModule.get_transform(tuple(img_size))
+    allowed_ids = None
+    if args.image_ids_file:
+        allowed_ids = []
+        with open(args.image_ids_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                allowed_ids.append(line.split(',')[0].strip())
+    dataset = UnifiedLmdbDataset(
+        args.unified_db,
+        charset=CHARSET_SLP34K,
+        max_label_len=getattr(hp, 'max_label_length', 50),
+        transform=transform,
+        allowed_ids=allowed_ids,
+    )
     loader  = DataLoader(
         dataset, batch_size=args.batch_size,
         num_workers=args.num_workers, collate_fn=collate_fn,
@@ -196,14 +266,42 @@ def main():
 
     # ── inference ─────────────────────────────────────────────────────────────
     rows = []
+    diag_rows = []
     correct_count = 0
 
     for imgs, labels, metas in tqdm(loader, desc='Inference'):
         imgs   = imgs.to(args.device)
         memory = model.encode(imgs)
+        preds_before = [None] * len(labels)
+        if diagnostics_enabled and getattr(model, 'use_selective_eos_aware_decoding', False):
+            old_use_eos = model.use_selective_eos_aware_decoding
+            old_diag = getattr(model, 'enable_eos_diagnostics', False)
+            model.use_selective_eos_aware_decoding = False
+            model.enable_eos_diagnostics = False
+            logits_before = model.forward(imgs)
+            probs_before = logits_before.softmax(-1)
+            preds_before, _ = model.tokenizer.decode(probs_before)
+            model.use_selective_eos_aware_decoding = old_use_eos
+            model.enable_eos_diagnostics = old_diag
+
         logits = model.forward(imgs)
         probs  = logits.softmax(-1)
         preds, _ = model.tokenizer.decode(probs)
+        batch_diag = []
+        if diagnostics_enabled and hasattr(model, 'consume_last_eos_diagnostics_batch'):
+            batch_diag = model.consume_last_eos_diagnostics_batch()
+        if not batch_diag:
+            batch_diag = [{
+                'pred_len_from_head': -1,
+                'uncertainty_value': 0.0,
+                'gating_enabled': False,
+                'passed_uncertainty_gate': False,
+                'passed_length_gate': False,
+                'eos_bias_applied': False,
+                'num_steps_modified': 0,
+                'num_steps_argmax_changed': 0,
+                'any_token_changed': False,
+            } for _ in labels]
 
         if has_head:
             len_logits  = model.length_head(memory)
@@ -211,7 +309,8 @@ def main():
         else:
             head_preds = [-1] * len(labels)
 
-        for pred_raw, gt, meta, head_len in zip(preds, labels, metas, head_preds):
+        for pred_before_raw, pred_raw, gt, meta, head_len, diag in zip(preds_before, preds, labels, metas, head_preds, batch_diag):
+            pred_before = model.charset_adapter(pred_before_raw) if pred_before_raw is not None else ''
             pred       = model.charset_adapter(pred_raw)
             is_correct = pred == gt
             gt_len     = len(gt)
@@ -235,6 +334,28 @@ def main():
                 'eos_type':          get_eos_type(gt_len, pred_len),
                 'pred_len_from_head': int(head_len),
             })
+            if diagnostics_enabled:
+                pred_before_len = len(pred_before)
+                diag_rows.append({
+                    'image_id':               str(meta.get('id', '')),
+                    'correct_before':         pred_before == gt,
+                    'pred_before':            pred_before,
+                    'pred_after':             pred,
+                    'final_prediction_changed': pred_before != pred,
+                    'gt_len':                 gt_len,
+                    'pred_text_len_before':   pred_before_len,
+                    'pred_text_len_after':    pred_len,
+                    'pred_len_from_head':     int(diag['pred_len_from_head']),
+                    'uncertainty_value':      float(diag['uncertainty_value']),
+                    'gating_enabled':         bool(diag['gating_enabled']),
+                    'passed_uncertainty_gate': bool(diag['passed_uncertainty_gate']),
+                    'passed_length_gate':     bool(diag['passed_length_gate']),
+                    'eos_bias_applied':       bool(diag['eos_bias_applied']),
+                    'num_steps_modified':     int(diag['num_steps_modified']),
+                    'num_steps_argmax_changed': int(diag['num_steps_argmax_changed']),
+                    'eos_type_before':        get_eos_type(gt_len, pred_before_len),
+                    'eos_type_after':         get_eos_type(gt_len, pred_len),
+                })
 
     # ── report ────────────────────────────────────────────────────────────────
     total       = len(rows)
@@ -265,6 +386,69 @@ def main():
     summary_path = out_dir / 'eval_summary.txt'
     summary_path.write_text('\n'.join(summary_lines) + '\n', encoding='utf-8')
     print(f'Summary: {summary_path}')
+
+    if diagnostics_enabled:
+        diag_summary = model.get_eos_diagnostics_summary() if hasattr(model, 'get_eos_diagnostics_summary') else {}
+        diag_summary['num_samples_final_prediction_changed'] = sum(
+            1 for r in diag_rows if r['final_prediction_changed']
+        )
+        if args.save_eos_diagnostics_csv or args.save_eos_diagnostics_report:
+            diag_csv_path = out_dir / 'eos_diagnostics.csv'
+            with open(diag_csv_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=DIAG_FIELDNAMES)
+                writer.writeheader()
+                writer.writerows(diag_rows)
+            print(f'Diagnostics CSV: {diag_csv_path}')
+        if args.save_eos_diagnostics_report:
+            changed_counter = Counter()
+            for r in diag_rows:
+                if r['final_prediction_changed']:
+                    changed_counter[(r['eos_type_before'], r['eos_type_after'])] += 1
+            reason = 'gating too strict'
+            if diag_summary.get('num_steps_eos_logit_modified', 0) > 0 and diag_summary.get('num_steps_argmax_changed', 0) == 0:
+                reason = 'bias too weak'
+            elif diag_summary.get('num_steps_argmax_changed', 0) > 0 and diag_summary.get('num_samples_final_prediction_changed', 0) == 0:
+                reason = 'token-level change did not propagate to final prediction'
+            report_path = out_dir / 'phase2_diagnostic_report.md'
+            lines = [
+                '# Phase 2 Diagnostic Report',
+                '',
+                '## Summary',
+                f"- total_samples: {diag_summary.get('total_samples', 0)}",
+                f"- num_samples_gating_enabled: {diag_summary.get('num_samples_gating_enabled', 0)}",
+                f"- num_samples_gating_disabled: {diag_summary.get('num_samples_gating_disabled', 0)}",
+                f"- num_samples_failed_uncertainty_gate: {diag_summary.get('num_samples_failed_uncertainty_gate', 0)}",
+                f"- num_samples_failed_length_gate: {diag_summary.get('num_samples_failed_length_gate', 0)}",
+                f"- num_samples_eos_bias_applied: {diag_summary.get('num_samples_eos_bias_applied', 0)}",
+                f"- num_samples_any_token_changed: {diag_summary.get('num_samples_any_token_changed', 0)}",
+                f"- num_samples_final_prediction_changed: {diag_summary.get('num_samples_final_prediction_changed', 0)}",
+                '',
+                '## Step-Level',
+                f"- total_decode_steps: {diag_summary.get('total_decode_steps', 0)}",
+                f"- num_steps_gating_active: {diag_summary.get('num_steps_gating_active', 0)}",
+                f"- num_steps_eos_logit_modified: {diag_summary.get('num_steps_eos_logit_modified', 0)}",
+                f"- num_steps_eos_rank_changed: {diag_summary.get('num_steps_eos_rank_changed', 0)}",
+                f"- num_steps_argmax_changed: {diag_summary.get('num_steps_argmax_changed', 0)}",
+                '',
+                '## Interpretation',
+                f"- current 0-change diagnosis: {reason}",
+                '',
+                '## EOS Type Changes',
+            ]
+            if changed_counter:
+                for (before, after), count in changed_counter.items():
+                    lines.append(f"- {before} -> {after}: {count}")
+            else:
+                lines.append('- no final prediction changes')
+            lines.extend([
+                '',
+                '## Next Parameter To Tune',
+                '- If almost no samples enter gating: lower `uncertainty_threshold` or relax length gating.',
+                '- If EOS logits are modified but argmax never changes: increase `eos_suppress_bias` / `eos_boost_bias`.',
+                '- If argmax changes but final prediction does not: inspect when the changed token occurs and whether it is before first EOS.',
+            ])
+            report_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+            print(f'Diagnostics Report: {report_path}')
 
     print('\nNext — generate analysis report:')
     print(f'  python evaluation/generate_phase1_report.py \\')

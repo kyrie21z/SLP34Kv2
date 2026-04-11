@@ -13,10 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import csv
 import math
 from functools import partial
 from itertools import permutations
-from typing import Sequence, Any, Optional
+from pathlib import Path
+from typing import Sequence, Any, Optional, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -184,12 +186,104 @@ def normalize(*xs):
 
 class Model(CrossEntropySystem):
 
+    GLYPH_CONFUSION_NEIGHBORS = {
+        '0': ('1', '2', '6', '8', '9'),
+        '1': ('0', '7', '8'),
+        '2': ('0', '1', '8', '9'),
+        '3': ('8',),
+        '5': ('6', '8'),
+        '6': ('0', '5', '8', '9'),
+        '7': ('1',),
+        '8': ('0', '1', '2', '3', '5', '6', '9'),
+        '9': ('0', '2', '6', '8'),
+        'G': ('I', 'O'),
+        'H': ('I', 'N', 'Y'),
+        'I': ('G', 'H', 'N', 'O', 'Y'),
+        'N': ('H', 'I', 'O'),
+        'O': ('G', 'I', 'N'),
+        'Y': ('H', 'I'),
+    }
+
+    GLYPH_SINK_WEIGHTS = {
+        '0': 0.55,
+        '1': 0.35,
+        '6': 0.65,
+        '8': 0.80,
+        '9': 0.50,
+        'G': 0.30,
+        'H': 0.25,
+        'I': 0.45,
+        'N': 0.25,
+        'O': 0.30,
+        'Y': 0.25,
+    }
+
+    DEFAULT_SUBSTITUTION_SOURCE_WEIGHTS = {
+        ('6', '8'): 1.00,
+        ('8', '6'): 0.90,
+        ('9', '8'): 0.85,
+        ('8', '9'): 0.70,
+        ('1', '0'): 0.65,
+        ('0', '1'): 0.60,
+        ('5', '6'): 0.60,
+        ('0', '8'): 0.60,
+        ('3', '8'): 0.58,
+        ('5', '8'): 0.54,
+        ('0', '9'): 0.52,
+        ('9', '0'): 0.48,
+        ('1', '8'): 0.56,
+        ('8', '1'): 0.52,
+        ('6', '0'): 0.48,
+        ('2', '0'): 0.42,
+        ('2', '8'): 0.42,
+        ('I', 'G'): 0.38,
+        ('G', 'I'): 0.34,
+        ('O', 'I'): 0.32,
+        ('I', 'N'): 0.28,
+        ('N', 'O'): 0.26,
+        ('Y', 'H'): 0.24,
+    }
+
     def __init__(self, charset_train: str, charset_test: str, max_label_length: int,
                  batch_size: int, lr: float, warmup_pct: float, weight_decay: float,
                  img_size: Sequence[int], embed_dim: int, mae_pretrained_path: str,
                  dec_num_heads: int, dec_mlp_ratio: int, dec_depth: int,
                  perm_num: int, perm_forward: bool, perm_mirrored: bool,
                  decode_ar: bool, refine_iters: int, dropout: float, 
+                 use_selective_eos_aware_decoding: bool = False,
+                 use_predicted_length_for_eos: bool = True,
+                 eos_long_seq_threshold: int = 21,
+                 eos_suppress_margin: int = 2,
+                 eos_neutral_margin: int = 1,
+                 eos_boost_margin: int = 2,
+                 eos_suppress_bias: float = -2.0,
+                 eos_boost_bias: float = 2.0,
+                 use_uncertainty_conditioned_eos: bool = False,
+                 uncertainty_type: str = 'mean_token_entropy',
+                 uncertainty_threshold: float = 0.30,
+                 eos_bias_scale_high_uncertainty: float = 1.0,
+                 eos_bias_scale_low_uncertainty: float = 0.0,
+                 use_length_bucket_gating: bool = False,
+                 use_meta_gating: bool = False,
+                 enable_eos_diagnostics: bool = False,
+                 use_glyph_confusion_bias: bool = False,
+                 glyph_confusion_margin_threshold: float = 1.25,
+                 glyph_confusion_bias_scale: float = 0.75,
+                 glyph_confusion_alt_boost: float = 0.35,
+                 glyph_confusion_candidate_topk: int = 3,
+                 use_substitution_confusion_bias: bool = False,
+                 substitution_confusion_margin_threshold: float = 1.40,
+                 substitution_confusion_bias_scale: float = 0.90,
+                 substitution_confusion_alt_boost: float = 0.55,
+                 substitution_confusion_candidate_topk: int = 4,
+                 substitution_confusion_pairs_path: str = 'evaluation/results/M05/confusion_pairs_topk.csv',
+                 use_substitution_train_aux: bool = False,
+                 substitution_train_loss_weight: float = 0.15,
+                 substitution_train_margin: float = 0.60,
+                 substitution_train_topk: int = 12,
+                 use_joint_glyph_train_aux: bool = False,
+                 joint_glyph_loss_weight: float = 0.05,
+                 joint_glyph_margin: float = 0.35,
                  use_length_head: bool = False, length_loss_weight: float = 0.1,
                  max_seq_length_for_head: int = 50, **kwargs: Any) -> None:
         super().__init__(charset_train, charset_test, batch_size, lr, warmup_pct, weight_decay)
@@ -199,6 +293,43 @@ class Model(CrossEntropySystem):
         self.use_length_head = use_length_head
         self.length_loss_weight = length_loss_weight
         self.max_seq_length_for_head = max_seq_length_for_head
+        self.use_selective_eos_aware_decoding = use_selective_eos_aware_decoding
+        self.use_predicted_length_for_eos = use_predicted_length_for_eos
+        self.eos_long_seq_threshold = eos_long_seq_threshold
+        self.eos_suppress_margin = eos_suppress_margin
+        self.eos_neutral_margin = eos_neutral_margin
+        self.eos_boost_margin = eos_boost_margin
+        self.eos_suppress_bias = eos_suppress_bias
+        self.eos_boost_bias = eos_boost_bias
+        self.use_uncertainty_conditioned_eos = use_uncertainty_conditioned_eos
+        self.uncertainty_type = uncertainty_type
+        self.uncertainty_threshold = uncertainty_threshold
+        self.eos_bias_scale_high_uncertainty = eos_bias_scale_high_uncertainty
+        self.eos_bias_scale_low_uncertainty = eos_bias_scale_low_uncertainty
+        self.use_length_bucket_gating = use_length_bucket_gating
+        # Real-world inference usually lacks metadata; keep the flag for future expansion.
+        self.use_meta_gating = use_meta_gating
+        self.enable_eos_diagnostics = enable_eos_diagnostics
+        self._eos_diag_summary = None
+        self._last_eos_diag_batch = []
+        self.use_glyph_confusion_bias = use_glyph_confusion_bias
+        self.glyph_confusion_margin_threshold = glyph_confusion_margin_threshold
+        self.glyph_confusion_bias_scale = glyph_confusion_bias_scale
+        self.glyph_confusion_alt_boost = glyph_confusion_alt_boost
+        self.glyph_confusion_candidate_topk = glyph_confusion_candidate_topk
+        self.use_substitution_confusion_bias = use_substitution_confusion_bias
+        self.substitution_confusion_margin_threshold = substitution_confusion_margin_threshold
+        self.substitution_confusion_bias_scale = substitution_confusion_bias_scale
+        self.substitution_confusion_alt_boost = substitution_confusion_alt_boost
+        self.substitution_confusion_candidate_topk = substitution_confusion_candidate_topk
+        self.substitution_confusion_pairs_path = substitution_confusion_pairs_path
+        self.use_substitution_train_aux = use_substitution_train_aux
+        self.substitution_train_loss_weight = substitution_train_loss_weight
+        self.substitution_train_margin = substitution_train_margin
+        self.substitution_train_topk = substitution_train_topk
+        self.use_joint_glyph_train_aux = use_joint_glyph_train_aux
+        self.joint_glyph_loss_weight = joint_glyph_loss_weight
+        self.joint_glyph_margin = joint_glyph_margin
 
         self.coef_lr = kwargs["coef_lr"] if "coef_lr" in kwargs.keys() else 1.0
         self.coef_wd = kwargs["coef_wd"] if "coef_wd" in kwargs.keys() else 1.0
@@ -263,6 +394,21 @@ class Model(CrossEntropySystem):
         # # We don't predict <bos> nor <pad>
         self.head = nn.Linear(embed_dim, len(self.tokenizer) - 2)
         self.text_embed = TokenEmbedding(len(self.tokenizer), embed_dim)
+        self._decode_token_strings = self.tokenizer._itos[:-2]
+        self._decode_char_to_id = {
+            token: idx for idx, token in enumerate(self._decode_token_strings)
+            if token not in {self.tokenizer.EOS}
+        }
+        self._glyph_prior_bank = self._build_glyph_prior_bank()
+        self._substitution_pairs = self._load_substitution_pairs()
+        substitution_ids, substitution_weights, substitution_mask = self._build_substitution_aux_tables()
+        glyph_ids, glyph_weights, glyph_mask = self._build_glyph_aux_tables()
+        self.register_buffer('substitution_aux_ids', substitution_ids, persistent=False)
+        self.register_buffer('substitution_aux_weights', substitution_weights, persistent=False)
+        self.register_buffer('substitution_aux_mask', substitution_mask, persistent=False)
+        self.register_buffer('glyph_aux_ids', glyph_ids, persistent=False)
+        self.register_buffer('glyph_aux_weights', glyph_weights, persistent=False)
+        self.register_buffer('glyph_aux_mask', glyph_mask, persistent=False)
         
         # Length prediction head (optional)
         if self.use_length_head:
@@ -304,6 +450,391 @@ class Model(CrossEntropySystem):
             tgt_query = self.pos_queries[:, :L].expand(N, -1, -1) #B*T*768
         tgt_query = self.dropout(tgt_query)#B*T*768
         return self.decoder(query=tgt_query, content=tgt_emb, memory=memory, query_mask=tgt_query_mask, content_mask=tgt_mask, content_key_padding_mask=tgt_padding_mask)
+
+    def _use_selective_eos_bias(self, testing: bool) -> bool:
+        return (
+            testing
+            and self.decode_ar
+            and self.use_selective_eos_aware_decoding
+            and self.use_predicted_length_for_eos
+            and self.use_length_head
+        )
+
+    def reset_eos_diagnostics(self) -> None:
+        self._eos_diag_summary = {
+            'total_samples': 0,
+            'num_samples_gating_enabled': 0,
+            'num_samples_gating_disabled': 0,
+            'num_samples_failed_uncertainty_gate': 0,
+            'num_samples_failed_length_gate': 0,
+            'num_samples_eos_bias_applied': 0,
+            'num_samples_any_token_changed': 0,
+            'num_samples_final_prediction_changed': 0,
+            'total_decode_steps': 0,
+            'num_steps_gating_active': 0,
+            'num_steps_eos_logit_modified': 0,
+            'num_steps_eos_rank_changed': 0,
+            'num_steps_argmax_changed': 0,
+        }
+        self._last_eos_diag_batch = []
+
+    def get_eos_diagnostics_summary(self) -> Dict[str, Any]:
+        if self._eos_diag_summary is None:
+            self.reset_eos_diagnostics()
+        return dict(self._eos_diag_summary)
+
+    def consume_last_eos_diagnostics_batch(self) -> List[Dict[str, Any]]:
+        batch = self._last_eos_diag_batch
+        self._last_eos_diag_batch = []
+        return batch
+
+    def _compute_uncertainty_score(
+        self,
+        step_logits: Tensor,
+        running_entropy_sum: Optional[Tensor],
+        running_max_prob_sum: Optional[Tensor],
+        step_index: int,
+    ) -> Tensor:
+        probs = step_logits.softmax(-1)
+        if self.uncertainty_type == 'mean_token_entropy':
+            entropy = -(probs * probs.clamp_min(1e-8).log()).sum(dim=-1)
+            entropy = entropy / math.log(probs.shape[-1])
+            if running_entropy_sum is None:
+                return entropy
+            running_entropy_sum += entropy
+            return running_entropy_sum / float(step_index + 1)
+        if self.uncertainty_type == 'top1_top2_margin':
+            top2 = probs.topk(k=2, dim=-1).values
+            margin = top2[:, 0] - top2[:, 1]
+            return 1.0 - margin
+        if self.uncertainty_type == 'sequence_confidence':
+            max_probs = probs.max(dim=-1).values
+            if running_max_prob_sum is None:
+                return 1.0 - max_probs
+            running_max_prob_sum += max_probs
+            return 1.0 - (running_max_prob_sum / float(step_index + 1))
+        raise ValueError(f'Unsupported uncertainty_type: {self.uncertainty_type}')
+
+    def _apply_selective_eos_bias(
+        self,
+        step_logits: Tensor,
+        step_index: int,
+        pred_lengths: Tensor,
+        running_entropy_sum: Optional[Tensor],
+        running_max_prob_sum: Optional[Tensor],
+    ) -> Tuple[Tensor, Dict[str, Tensor]]:
+        eos_logits_before = step_logits[:, self.eos_id].clone()
+        argmax_before = step_logits.argmax(dim=-1)
+        eos_rank_before = (step_logits > eos_logits_before.unsqueeze(1)).sum(dim=-1) + 1
+
+        passed_length_gate = torch.ones(step_logits.shape[0], dtype=torch.bool, device=step_logits.device)
+        if self.use_length_bucket_gating:
+            passed_length_gate &= pred_lengths >= self.eos_long_seq_threshold
+        active = passed_length_gate.clone()
+
+        scale = torch.ones(step_logits.shape[0], device=step_logits.device)
+        uncertainty = torch.zeros(step_logits.shape[0], device=step_logits.device)
+        passed_uncertainty_gate = torch.ones(step_logits.shape[0], dtype=torch.bool, device=step_logits.device)
+        if self.use_uncertainty_conditioned_eos:
+            uncertainty = self._compute_uncertainty_score(
+                step_logits, running_entropy_sum, running_max_prob_sum, step_index
+            )
+            high_uncertainty = uncertainty >= self.uncertainty_threshold
+            passed_uncertainty_gate = high_uncertainty
+            scale = torch.where(
+                high_uncertainty,
+                torch.full_like(scale, self.eos_bias_scale_high_uncertainty),
+                torch.full_like(scale, self.eos_bias_scale_low_uncertainty),
+            )
+            active &= passed_uncertainty_gate & (scale != 0)
+
+        bias = torch.zeros(step_logits.shape[0], device=step_logits.device)
+        suppress_mask = step_index < (pred_lengths - self.eos_suppress_margin)
+        neutral_mask = (pred_lengths - step_index).abs() <= self.eos_neutral_margin
+        boost_mask = step_index > (pred_lengths + self.eos_boost_margin)
+        bias = torch.where(
+            suppress_mask,
+            torch.full_like(bias, self.eos_suppress_bias),
+            bias,
+        )
+        bias = torch.where(
+            boost_mask & ~neutral_mask,
+            torch.full_like(bias, self.eos_boost_bias),
+            bias,
+        )
+        bias = bias * scale
+        applied_bias = torch.where(active, bias, torch.zeros_like(bias))
+        step_logits[:, self.eos_id] = step_logits[:, self.eos_id] + applied_bias
+
+        eos_logits_after = step_logits[:, self.eos_id]
+        argmax_after = step_logits.argmax(dim=-1)
+        eos_rank_after = (step_logits > eos_logits_after.unsqueeze(1)).sum(dim=-1) + 1
+        diag = {
+            'uncertainty': uncertainty,
+            'passed_length_gate': passed_length_gate,
+            'passed_uncertainty_gate': passed_uncertainty_gate,
+            'gating_active': active,
+            'eos_logit_modified': applied_bias != 0,
+            'eos_rank_changed': eos_rank_before != eos_rank_after,
+            'argmax_changed': argmax_before != argmax_after,
+        }
+        return step_logits, diag
+
+    def _apply_glyph_confusion_bias(self, step_logits: Tensor) -> Tensor:
+        if not self.use_glyph_confusion_bias:
+            return step_logits
+
+        topk = min(self.glyph_confusion_candidate_topk, step_logits.shape[-1])
+        if topk < 2:
+            return step_logits
+
+        top_vals, top_ids = step_logits.topk(k=topk, dim=-1)
+        for batch_idx in range(step_logits.shape[0]):
+            top1_id = int(top_ids[batch_idx, 0].item())
+            top1_char = self._decode_token_strings[top1_id]
+            if top1_char == self.tokenizer.EOS:
+                continue
+
+            neighbors = self.GLYPH_CONFUSION_NEIGHBORS.get(top1_char)
+            sink_weight = self.GLYPH_SINK_WEIGHTS.get(top1_char, 0.0)
+            if not neighbors or sink_weight <= 0:
+                continue
+
+            for alt_rank in range(1, topk):
+                alt_id = int(top_ids[batch_idx, alt_rank].item())
+                alt_char = self._decode_token_strings[alt_id]
+                if alt_char not in neighbors:
+                    continue
+
+                margin = float(top_vals[batch_idx, 0].item() - top_vals[batch_idx, alt_rank].item())
+                if margin >= self.glyph_confusion_margin_threshold:
+                    continue
+
+                prototype_weight = float(self._glyph_prior_bank[top1_id, alt_id].item())
+                if prototype_weight <= 0:
+                    continue
+                scaled = (1.0 - (margin / max(self.glyph_confusion_margin_threshold, 1e-6)))
+                penalty = sink_weight * prototype_weight * self.glyph_confusion_bias_scale * scaled
+                if penalty <= 0:
+                    continue
+
+                step_logits[batch_idx, top1_id] -= penalty
+                step_logits[batch_idx, alt_id] += penalty * self.glyph_confusion_alt_boost
+                break
+
+        return step_logits
+
+    def _build_glyph_prior_bank(self) -> Tensor:
+        size = len(self._decode_token_strings)
+        bank = torch.zeros(size, size, dtype=torch.float32)
+        for sink_char, neighbors in self.GLYPH_CONFUSION_NEIGHBORS.items():
+            sink_id = self._decode_char_to_id.get(sink_char)
+            if sink_id is None:
+                continue
+            sink_weight = self.GLYPH_SINK_WEIGHTS.get(sink_char, 0.0)
+            for src_char in neighbors:
+                src_id = self._decode_char_to_id.get(src_char)
+                if src_id is None:
+                    continue
+                reverse = 1.0 if sink_char in self.GLYPH_CONFUSION_NEIGHBORS.get(src_char, ()) else 0.0
+                bank[sink_id, src_id] = max(bank[sink_id, src_id], sink_weight * (0.7 + 0.3 * reverse))
+        return bank
+
+    def _resolve_substitution_pairs_path(self) -> Optional[Path]:
+        raw_path = Path(self.substitution_confusion_pairs_path)
+        candidates = []
+        if raw_path.is_absolute():
+            candidates.append(raw_path)
+        else:
+            project_root = Path(__file__).resolve().parents[3]
+            candidates.extend([
+                Path.cwd() / raw_path,
+                project_root / raw_path,
+            ])
+        for path in candidates:
+            if path.exists():
+                return path
+        return None
+
+    def _load_substitution_pairs(self) -> Dict[Tuple[str, str], float]:
+        pairs = dict(self.DEFAULT_SUBSTITUTION_SOURCE_WEIGHTS)
+        path = self._resolve_substitution_pairs_path()
+        if path is None:
+            return pairs
+
+        directional_counts: Dict[Tuple[str, str], int] = {}
+        try:
+            with path.open('r', encoding='utf-8', newline='') as f:
+                for row in csv.DictReader(f):
+                    if row.get('subset_name') != 'overall':
+                        continue
+                    src_char = row.get('src_char', '')
+                    tgt_char = row.get('tgt_char', '')
+                    if not src_char or not tgt_char:
+                        continue
+                    count = int(row.get('count', 0))
+                    if count <= 0:
+                        continue
+                    directional_counts[(src_char, tgt_char)] = count
+        except Exception:
+            return pairs
+
+        if not directional_counts:
+            return pairs
+
+        max_count = max(directional_counts.values())
+        for pair, count in directional_counts.items():
+            src_char, tgt_char = pair
+            if src_char not in self._decode_char_to_id or tgt_char not in self._decode_char_to_id:
+                continue
+            normalized = count / max_count
+            pairs[pair] = max(pairs.get(pair, 0.0), normalized)
+        return pairs
+
+    def _apply_substitution_confusion_bias(self, step_logits: Tensor) -> Tensor:
+        if not self.use_substitution_confusion_bias:
+            return step_logits
+
+        topk = min(self.substitution_confusion_candidate_topk, step_logits.shape[-1])
+        if topk < 2:
+            return step_logits
+
+        top_vals, top_ids = step_logits.topk(k=topk, dim=-1)
+        for batch_idx in range(step_logits.shape[0]):
+            sink_id = int(top_ids[batch_idx, 0].item())
+            sink_char = self._decode_token_strings[sink_id]
+            if sink_char == self.tokenizer.EOS:
+                continue
+
+            best_candidate = None
+            for alt_rank in range(1, topk):
+                src_id = int(top_ids[batch_idx, alt_rank].item())
+                src_char = self._decode_token_strings[src_id]
+                pair_weight = self._substitution_pairs.get((src_char, sink_char), 0.0)
+                if pair_weight <= 0:
+                    continue
+                margin = float(top_vals[batch_idx, 0].item() - top_vals[batch_idx, alt_rank].item())
+                if margin >= self.substitution_confusion_margin_threshold:
+                    continue
+                score = pair_weight - 0.1 * margin
+                if best_candidate is None or score > best_candidate[0]:
+                    best_candidate = (score, src_id, margin, pair_weight)
+
+            if best_candidate is None:
+                continue
+
+            _, src_id, margin, pair_weight = best_candidate
+            scaled = (1.0 - (margin / max(self.substitution_confusion_margin_threshold, 1e-6)))
+            penalty = pair_weight * self.substitution_confusion_bias_scale * scaled
+            if penalty <= 0:
+                continue
+            step_logits[batch_idx, sink_id] -= penalty
+            step_logits[batch_idx, src_id] += penalty * self.substitution_confusion_alt_boost
+
+        return step_logits
+
+    def _build_substitution_aux_tables(self) -> Tuple[Tensor, Tensor, Tensor]:
+        size = len(self._decode_token_strings)
+        grouped: Dict[int, List[Tuple[int, float]]] = {}
+        for (src_char, tgt_char), weight in self._substitution_pairs.items():
+            src_id = self._decode_char_to_id.get(src_char)
+            tgt_id = self._decode_char_to_id.get(tgt_char)
+            if src_id is None or tgt_id is None or src_id == tgt_id or weight <= 0:
+                continue
+            grouped.setdefault(src_id, []).append((tgt_id, float(weight)))
+
+        max_neighbors = max((min(len(v), self.substitution_train_topk) for v in grouped.values()), default=1)
+        ids = torch.zeros(size, max_neighbors, dtype=torch.long)
+        weights = torch.zeros(size, max_neighbors, dtype=torch.float32)
+        mask = torch.zeros(size, max_neighbors, dtype=torch.bool)
+        for src_id, items in grouped.items():
+            items = sorted(items, key=lambda x: x[1], reverse=True)[:max_neighbors]
+            total = sum(weight for _, weight in items)
+            for idx, (tgt_id, weight) in enumerate(items):
+                ids[src_id, idx] = tgt_id
+                weights[src_id, idx] = weight / total if total > 0 else 0.0
+                mask[src_id, idx] = True
+        return ids, weights, mask
+
+    def _build_glyph_aux_tables(self) -> Tuple[Tensor, Tensor, Tensor]:
+        size = len(self._decode_token_strings)
+        grouped: Dict[int, List[Tuple[int, float]]] = {}
+        for src_char, src_id in self._decode_char_to_id.items():
+            neighbors = set(self.GLYPH_CONFUSION_NEIGHBORS.get(src_char, ()))
+            for candidate, candidate_neighbors in self.GLYPH_CONFUSION_NEIGHBORS.items():
+                if src_char in candidate_neighbors:
+                    neighbors.add(candidate)
+            for tgt_char in neighbors:
+                tgt_id = self._decode_char_to_id.get(tgt_char)
+                if tgt_id is None or tgt_id == src_id:
+                    continue
+                weight = float(max(self._glyph_prior_bank[src_id, tgt_id].item(), self._glyph_prior_bank[tgt_id, src_id].item()))
+                if weight <= 0:
+                    weight = 0.25
+                grouped.setdefault(src_id, []).append((tgt_id, weight))
+
+        max_neighbors = max((len(v) for v in grouped.values()), default=1)
+        ids = torch.zeros(size, max_neighbors, dtype=torch.long)
+        weights = torch.zeros(size, max_neighbors, dtype=torch.float32)
+        mask = torch.zeros(size, max_neighbors, dtype=torch.bool)
+        for src_id, items in grouped.items():
+            dedup: Dict[int, float] = {}
+            for tgt_id, weight in items:
+                dedup[tgt_id] = max(dedup.get(tgt_id, 0.0), weight)
+            ordered = sorted(dedup.items(), key=lambda x: x[1], reverse=True)
+            total = sum(weight for _, weight in ordered)
+            for idx, (tgt_id, weight) in enumerate(ordered):
+                ids[src_id, idx] = tgt_id
+                weights[src_id, idx] = weight / total if total > 0 else 0.0
+                mask[src_id, idx] = True
+        return ids, weights, mask
+
+    def _compute_substitution_aux_loss(self, logits: Tensor, targets: Tensor) -> Tensor:
+        if not self.use_substitution_train_aux:
+            return logits.new_zeros(())
+
+        flat_logits = logits.flatten(end_dim=1)
+        flat_targets = targets.flatten()
+        valid = (flat_targets != self.pad_id) & (flat_targets < self.substitution_aux_ids.shape[0])
+        if not valid.any():
+            return flat_logits.new_zeros(())
+
+        flat_logits = flat_logits[valid]
+        flat_targets = flat_targets[valid]
+        gt_logits = flat_logits.gather(1, flat_targets.unsqueeze(1)).squeeze(1)
+        conf_ids = self.substitution_aux_ids[flat_targets]
+        conf_weights = self.substitution_aux_weights[flat_targets]
+        conf_mask = self.substitution_aux_mask[flat_targets]
+        conf_logits = flat_logits.gather(1, conf_ids)
+        margin_gap = self.substitution_train_margin - (gt_logits.unsqueeze(1) - conf_logits)
+        penalties = F.relu(margin_gap) * conf_weights * conf_mask.float()
+        denom = conf_mask.float().sum().clamp_min(1.0)
+        return penalties.sum() / denom
+
+    def _compute_joint_glyph_aux_loss(self, hidden: Tensor, targets: Tensor) -> Tensor:
+        if not self.use_joint_glyph_train_aux:
+            return hidden.new_zeros(())
+
+        flat_hidden = hidden.flatten(end_dim=1)
+        flat_targets = targets.flatten()
+        valid = (flat_targets != self.pad_id) & (flat_targets < self.glyph_aux_ids.shape[0])
+        if not valid.any():
+            return flat_hidden.new_zeros(())
+
+        flat_hidden = F.normalize(flat_hidden[valid], dim=-1)
+        flat_targets = flat_targets[valid]
+        proto = F.normalize(self.head.weight, dim=-1)
+        gt_proto = proto[flat_targets]
+        gt_sim = (flat_hidden * gt_proto).sum(dim=-1)
+        conf_ids = self.glyph_aux_ids[flat_targets]
+        conf_weights = self.glyph_aux_weights[flat_targets]
+        conf_mask = self.glyph_aux_mask[flat_targets]
+        conf_proto = proto[conf_ids]
+        conf_sim = (flat_hidden.unsqueeze(1) * conf_proto).sum(dim=-1)
+        margin_gap = self.joint_glyph_margin - (gt_sim.unsqueeze(1) - conf_sim)
+        penalties = F.relu(margin_gap) * conf_weights * conf_mask.float()
+        denom = conf_mask.float().sum().clamp_min(1.0)
+        return penalties.sum() / denom
    
         
     def forward(self, images, max_length: Optional[int] = None) -> Tensor:
@@ -314,6 +845,31 @@ class Model(CrossEntropySystem):
         num_steps = max_length + 1 
         
         memory = self.encode(images) 
+        use_eos_bias = self._use_selective_eos_bias(testing)
+        diagnostics_active = testing and use_eos_bias and self.enable_eos_diagnostics
+        pred_lengths = None
+        running_entropy_sum = None
+        running_max_prob_sum = None
+        if use_eos_bias:
+            pred_lengths = self.length_head.predict(memory).clamp(max=self.max_label_length).to(self._device)
+            if self.uncertainty_type == 'mean_token_entropy':
+                running_entropy_sum = torch.zeros(bs, device=self._device)
+            elif self.uncertainty_type == 'sequence_confidence':
+                running_max_prob_sum = torch.zeros(bs, device=self._device)
+        if diagnostics_active and self._eos_diag_summary is None:
+            self.reset_eos_diagnostics()
+        if diagnostics_active:
+            sample_uncertainty_sum = torch.zeros(bs, device=self._device)
+            sample_uncertainty_count = torch.zeros(bs, device=self._device)
+            sample_passed_length_gate = torch.ones(bs, dtype=torch.bool, device=self._device)
+            if self.use_length_bucket_gating:
+                sample_passed_length_gate &= pred_lengths >= self.eos_long_seq_threshold
+            sample_passed_uncertainty_gate = torch.zeros(bs, dtype=torch.bool, device=self._device)
+            sample_gating_enabled = torch.zeros(bs, dtype=torch.bool, device=self._device)
+            sample_eos_bias_applied = torch.zeros(bs, dtype=torch.bool, device=self._device)
+            sample_any_token_changed = torch.zeros(bs, dtype=torch.bool, device=self._device)
+            sample_steps_modified = torch.zeros(bs, dtype=torch.long, device=self._device)
+            sample_steps_argmax_changed = torch.zeros(bs, dtype=torch.long, device=self._device)
 
         # Query positions up to `num_steps`
         pos_queries = self.pos_queries[:, :num_steps].expand(bs, -1, -1)
@@ -340,17 +896,68 @@ class Model(CrossEntropySystem):
                     tgt_query_mask=query_mask[i:j, :j],
                 )
                 # the next token probability is in the output's ith token position
-                p_i = self.head(tgt_out)
+                step_logits = self.head(tgt_out).squeeze(1)
+                if use_eos_bias:
+                    step_logits, diag = self._apply_selective_eos_bias(
+                        step_logits, i, pred_lengths, running_entropy_sum, running_max_prob_sum
+                    )
+                    if diagnostics_active:
+                        self._eos_diag_summary['total_decode_steps'] += bs
+                        self._eos_diag_summary['num_steps_gating_active'] += int(diag['gating_active'].sum().item())
+                        self._eos_diag_summary['num_steps_eos_logit_modified'] += int(diag['eos_logit_modified'].sum().item())
+                        self._eos_diag_summary['num_steps_eos_rank_changed'] += int(diag['eos_rank_changed'].sum().item())
+                        self._eos_diag_summary['num_steps_argmax_changed'] += int(diag['argmax_changed'].sum().item())
+                        sample_passed_uncertainty_gate |= diag['passed_uncertainty_gate']
+                        sample_gating_enabled |= diag['gating_active']
+                        sample_eos_bias_applied |= diag['eos_logit_modified']
+                        sample_any_token_changed |= diag['argmax_changed']
+                        sample_steps_modified += diag['eos_logit_modified'].long()
+                        sample_steps_argmax_changed += diag['argmax_changed'].long()
+                        if self.use_uncertainty_conditioned_eos:
+                            sample_uncertainty_sum += diag['uncertainty']
+                            sample_uncertainty_count += 1
+                step_logits = self._apply_glyph_confusion_bias(step_logits)
+                step_logits = self._apply_substitution_confusion_bias(step_logits)
+                p_i = step_logits.unsqueeze(1)
                 logits.append(p_i)
                 if j < num_steps:
                     # greedy decode. add the next token index to the target input
-                    tgt_in[:, j] = p_i.squeeze().argmax(-1)
+                    tgt_in[:, j] = step_logits.argmax(-1)
                     # Efficient batch decoding: If all output words have at least one EOS token, end decoding.
                     if testing and (tgt_in == self.tokenizer.eos_id).any(dim=-1).all():
                         
                         break
             t = len(logits)                
             logits = torch.cat(logits, dim=1)
+            if diagnostics_active:
+                if not self.use_uncertainty_conditioned_eos:
+                    sample_passed_uncertainty_gate[:] = True
+                mean_uncertainty = torch.where(
+                    sample_uncertainty_count > 0,
+                    sample_uncertainty_sum / sample_uncertainty_count.clamp_min(1),
+                    torch.zeros_like(sample_uncertainty_sum),
+                )
+                batch_diag = []
+                for b in range(bs):
+                    batch_diag.append({
+                        'pred_len_from_head': int(pred_lengths[b].item()),
+                        'uncertainty_value': float(mean_uncertainty[b].item()),
+                        'gating_enabled': bool(sample_gating_enabled[b].item()),
+                        'passed_uncertainty_gate': bool(sample_passed_uncertainty_gate[b].item()),
+                        'passed_length_gate': bool(sample_passed_length_gate[b].item()),
+                        'eos_bias_applied': bool(sample_eos_bias_applied[b].item()),
+                        'num_steps_modified': int(sample_steps_modified[b].item()),
+                        'num_steps_argmax_changed': int(sample_steps_argmax_changed[b].item()),
+                        'any_token_changed': bool(sample_any_token_changed[b].item()),
+                    })
+                self._last_eos_diag_batch = batch_diag
+                self._eos_diag_summary['total_samples'] += bs
+                self._eos_diag_summary['num_samples_gating_enabled'] += sum(x['gating_enabled'] for x in batch_diag)
+                self._eos_diag_summary['num_samples_gating_disabled'] += bs - sum(x['gating_enabled'] for x in batch_diag)
+                self._eos_diag_summary['num_samples_failed_uncertainty_gate'] += sum(not x['passed_uncertainty_gate'] for x in batch_diag)
+                self._eos_diag_summary['num_samples_failed_length_gate'] += sum(not x['passed_length_gate'] for x in batch_diag)
+                self._eos_diag_summary['num_samples_eos_bias_applied'] += sum(x['eos_bias_applied'] for x in batch_diag)
+                self._eos_diag_summary['num_samples_any_token_changed'] += sum(x['any_token_changed'] for x in batch_diag)
         else:
             # No prior context, so input is just <bos>. We query all positions.
             tgt_in = torch.full((bs, 1), self.tokenizer.bos_id, dtype=torch.long, device=self._device)
@@ -465,13 +1072,18 @@ class Model(CrossEntropySystem):
         tgt_padding_mask = (tgt_in == self.pad_id) | (tgt_in == self.eos_id)#B*32
 
         ocr_loss = 0
+        substitution_aux_loss = 0
+        joint_glyph_aux_loss = 0
         loss_numel = 0
         n = (tgt_out != self.pad_id).sum().item()
         for i, perm in enumerate(tgt_perms):
             tgt_mask, query_mask = self.generate_attn_masks(perm) 
             out = self.decode(tgt_in, memory, tgt_mask, tgt_padding_mask, tgt_query_mask=query_mask) # B * T * 768
-            logits = self.head(out).flatten(end_dim=1)  #(B * len(label+1),NUM_CLASS)
+            step_logits = self.head(out)
+            logits = step_logits.flatten(end_dim=1)  #(B * len(label+1),NUM_CLASS)
             ocr_loss += n * F.cross_entropy(logits, tgt_out.flatten(), ignore_index=self.pad_id)
+            substitution_aux_loss += n * self._compute_substitution_aux_loss(step_logits, tgt_out)
+            joint_glyph_aux_loss += n * self._compute_joint_glyph_aux_loss(out, tgt_out)
             loss_numel += n
             # After the second iteration (i.e. done with canonical and reverse orderings),
             # remove the [EOS] tokens for the succeeding perms
@@ -479,10 +1091,15 @@ class Model(CrossEntropySystem):
                 tgt_out = torch.where(tgt_out == self.eos_id, self.pad_id, tgt_out)
                 n = (tgt_out != self.pad_id).sum().item()
         
-        logits = self.head(out).flatten(end_dim=1)
+        step_logits = self.head(out)
+        logits = step_logits.flatten(end_dim=1)
         ocr_loss += n * F.cross_entropy(logits, tgt_out.flatten(), ignore_index=self.pad_id)
+        substitution_aux_loss += n * self._compute_substitution_aux_loss(step_logits, tgt_out)
+        joint_glyph_aux_loss += n * self._compute_joint_glyph_aux_loss(out, tgt_out)
         loss_numel += n        
         ocr_loss /= loss_numel
+        substitution_aux_loss /= loss_numel
+        joint_glyph_aux_loss /= loss_numel
         
         # Length prediction loss (optional)
         length_loss = 0.0
@@ -502,10 +1119,18 @@ class Model(CrossEntropySystem):
         loss = ocr_loss + 0.1 * cross_modal_loss
         if self.use_length_head:
             loss = loss + self.length_loss_weight * length_loss
+        if self.use_substitution_train_aux:
+            loss = loss + self.substitution_train_loss_weight * substitution_aux_loss
+        if self.use_joint_glyph_train_aux:
+            loss = loss + self.joint_glyph_loss_weight * joint_glyph_aux_loss
 
         self.log('loss', loss)
         self.log('ocr_loss', ocr_loss)
         self.log('cross_modal_loss', cross_modal_loss)
+        if self.use_substitution_train_aux:
+            self.log('substitution_aux_loss', substitution_aux_loss)
+        if self.use_joint_glyph_train_aux:
+            self.log('joint_glyph_aux_loss', joint_glyph_aux_loss)
 
         return loss
     

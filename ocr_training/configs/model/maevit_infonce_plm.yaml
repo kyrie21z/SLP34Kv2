@@ -21,6 +21,42 @@ coef_wd: 1.0
 decode_ar: true
 refine_iters: 1
 
+# Selective EOS-aware decoding (inference only)
+use_selective_eos_aware_decoding: false
+use_predicted_length_for_eos: true
+eos_long_seq_threshold: 21
+eos_suppress_margin: 2
+eos_neutral_margin: 1
+eos_boost_margin: 2
+eos_suppress_bias: -2.0
+eos_boost_bias: 2.0
+use_uncertainty_conditioned_eos: false
+uncertainty_type: mean_token_entropy
+uncertainty_threshold: 0.30
+eos_bias_scale_high_uncertainty: 1.0
+eos_bias_scale_low_uncertainty: 0.0
+use_length_bucket_gating: false
+use_meta_gating: false
+enable_eos_diagnostics: false
+use_glyph_confusion_bias: false
+glyph_confusion_margin_threshold: 1.25
+glyph_confusion_bias_scale: 0.75
+glyph_confusion_alt_boost: 0.35
+glyph_confusion_candidate_topk: 3
+use_substitution_confusion_bias: false
+substitution_confusion_margin_threshold: 1.40
+substitution_confusion_bias_scale: 0.90
+substitution_confusion_alt_boost: 0.55
+substitution_confusion_candidate_topk: 4
+substitution_confusion_pairs_path: evaluation/results/M05/confusion_pairs_topk.csv
+use_substitution_train_aux: false
+substitution_train_loss_weight: 0.15
+substitution_train_margin: 0.60
+substitution_train_topk: 12
+use_joint_glyph_train_aux: false
+joint_glyph_loss_weight: 0.05
+joint_glyph_margin: 0.35
+
 # Length prediction head (optional)
 use_length_head: false
 length_loss_weight: 0.1

@@ -55,6 +55,21 @@ def readfile(path):
     return ''.join(content)
 
 
+def load_pretrained_checkpoint_weights(model: BaseSystem, checkpoint_path: str) -> None:
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    state_dict = checkpoint.get('state_dict', checkpoint)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print(f'Loaded pretrained weights from: {checkpoint_path}')
+    print(f'Missing keys: {len(missing)} | Unexpected keys: {len(unexpected)}')
+    if missing:
+        print('First missing keys:', missing[:10])
+    if unexpected:
+        print('First unexpected keys:', unexpected[:10])
+
+
 @hydra.main(config_path='configs', config_name='main', version_base='1.2')
 def main(config: DictConfig):
 
@@ -89,6 +104,8 @@ def main(config: DictConfig):
         assert config.model.perm_num % 2 == 0, 'perm_num should be even if perm_mirrored = True'
 
     model: BaseSystem = hydra.utils.instantiate(config.model)
+    if config.pretrained:
+        load_pretrained_checkpoint_weights(model, hydra.utils.to_absolute_path(config.pretrained))
    
     print(summarize(model, 2))
 

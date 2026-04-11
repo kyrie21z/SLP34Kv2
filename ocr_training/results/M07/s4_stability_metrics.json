@@ -1,0 +1,96 @@
+{
+  "checkpoint": "outputs/M07/maevit_ctc_probe/2026-04-11_07-36-40_s4_stability_probe/checkpoints/last.ckpt",
+  "num_samples": 256,
+  "blank_token_rate": 0.0,
+  "empty_prediction_ratio": 0.0,
+  "avg_pred_len": 3.8984375,
+  "pred_len_distribution_top20": [
+    [
+      1,
+      216
+    ],
+    [
+      3,
+      7
+    ],
+    [
+      7,
+      4
+    ],
+    [
+      5,
+      2
+    ],
+    [
+      6,
+      2
+    ],
+    [
+      9,
+      2
+    ],
+    [
+      11,
+      2
+    ],
+    [
+      46,
+      2
+    ],
+    [
+      10,
+      1
+    ],
+    [
+      12,
+      1
+    ],
+    [
+      13,
+      1
+    ],
+    [
+      16,
+      1
+    ],
+    [
+      18,
+      1
+    ],
+    [
+      19,
+      1
+    ],
+    [
+      21,
+      1
+    ],
+    [
+      22,
+      1
+    ],
+    [
+      24,
+      1
+    ],
+    [
+      25,
+      1
+    ],
+    [
+      27,
+      1
+    ],
+    [
+      33,
+      1
+    ]
+  ],
+  "input_lengths_unique": [
+    196
+  ],
+  "target_length_min": 5,
+  "target_length_max": 30,
+  "target_len_gt_T_count": 0,
+  "illegal_prediction_count": 0
+}

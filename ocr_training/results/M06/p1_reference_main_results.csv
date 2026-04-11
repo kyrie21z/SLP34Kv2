@@ -1,0 +1,3 @@
+model_tag,num_samples,accuracy,replace_total,insert_total,delete_total,replace_share,replace_head_total,replace_middle_total,replace_tail_total
+baseline_raw,105,0.1619047619047619,193,18,19,0.8391304347826087,68,55,70
+m04_final_raw,105,0.0,198,4,25,0.8722466960352423,77,52,69
