@@ -1,0 +1,5 @@
+# @package _global_
+data:
+  train_dir: SLP34K_pairs_lmdb
+  val_dir: SLP34K_lmdb_test
+  test_dir: SLP34K_lmdb_benchmark

@@ -77,6 +77,12 @@ CSV_FIELDNAMES = [
     'image_id', 'quality', 'layout', 'vocabulary_type', 'resolution_type',
     'gt', 'pred', 'correct', 'error_type', 'note',
     'gt_len', 'pred_text_len', 'eos_type', 'pred_len_from_head',
+    'pair_id', 'sample_type', 'source_path', 'pair_path', 'single_path', 'has_counterpart',
+]
+
+PAIR_SUMMARY_FIELDNAMES = [
+    'pair_id', 'num_samples', 'num_correct', 'all_correct', 'any_correct',
+    'labels', 'sample_types', 'source_paths',
 ]
 
 DIAG_FIELDNAMES = [
@@ -612,6 +618,12 @@ def main():
                 'pred_text_len':     pred_len,
                 'eos_type':          get_eos_type(gt_len, pred_len),
                 'pred_len_from_head': int(head_len),
+                'pair_id':           meta.get('pair_id', ''),
+                'sample_type':       meta.get('sample_type', ''),
+                'source_path':       meta.get('source_path', ''),
+                'pair_path':         meta.get('pair_path', ''),
+                'single_path':       meta.get('single_path', ''),
+                'has_counterpart':   meta.get('has_counterpart', ''),
             })
             if diagnostics_enabled:
                 pred_before_len = len(pred_before)
@@ -654,6 +666,33 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     print(f'CSV saved: {csv_path}')
+
+    pair_rows = []
+    pair_groups = {}
+    for row in rows:
+        pair_id = row.get('pair_id', '')
+        if not pair_id:
+            continue
+        pair_groups.setdefault(pair_id, []).append(row)
+    if pair_groups:
+        for pair_id, group in sorted(pair_groups.items()):
+            num_correct = sum(bool(row['correct']) for row in group)
+            pair_rows.append({
+                'pair_id': pair_id,
+                'num_samples': len(group),
+                'num_correct': num_correct,
+                'all_correct': num_correct == len(group),
+                'any_correct': num_correct > 0,
+                'labels': '|'.join(sorted({row['gt'] for row in group})),
+                'sample_types': '|'.join(row['sample_type'] for row in group),
+                'source_paths': '|'.join(row['source_path'] for row in group),
+            })
+        pair_summary_path = out_dir / 'pair_summary.csv'
+        with open(pair_summary_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=PAIR_SUMMARY_FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(pair_rows)
+        print(f'Pair summary CSV: {pair_summary_path}')
 
     # ── save summary ──────────────────────────────────────────────────────────
     summary_lines = [

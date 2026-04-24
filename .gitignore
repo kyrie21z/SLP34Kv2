@@ -162,3 +162,4 @@ scripts/
 
 # 测试结果
 ocr_training/evaluation/*
+ocr_training/data_visualization/*

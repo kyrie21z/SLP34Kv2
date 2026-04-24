@@ -1,5 +1,0 @@
-segment_type,count,mean_position,median_position,std_position
-chinese,467,1.07,1.00,1.83
-digit,435,5.43,5.00,1.47
-pinyin,135,8.58,8.00,4.56
-suffix-quarter,121,10.07,9.00,5.36

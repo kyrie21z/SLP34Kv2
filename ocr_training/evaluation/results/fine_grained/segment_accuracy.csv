@@ -1,4 +1,0 @@
-segment_type,accuracy,correct,total
-chinese,95.66%,24730,25851
-digit,94.07%,21066,22395
-pinyin,90.40%,42085,46556

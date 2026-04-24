@@ -1,4 +1,0 @@
-subset,chinese_cer,digit_cer,pinyin_cer
-overall,4.08%,5.76%,6.82%
-hard,9.77%,15.34%,15.52%
-oov,8.55%,9.82%,15.58%
